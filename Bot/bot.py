@@ -5,19 +5,14 @@ import aiogram
 from aiogram import types
 from aiogram.filters import CommandStart, Command
 
-from Bot.llm_client import ask_openai, extract_store_query
+from Bot.llm_client import ask_openai
 from Bot.memory import (
     add_user_message,
     add_assistant_message,
     get_messages_for_model,
     reset_history,
 )
-from Bot.db import (
-    Database,
-    search_stores,
-    match_brand, 
-    match_city,
-)
+from Bot.db import Database
 
 dotenv.load_dotenv()
 token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -76,55 +71,6 @@ async def handle_user_query(message: types.Message):
     uid = await db.save_user(telegram_id, username)
 
     user_text = message.text
-    text_lower = user_text.lower()
-
-    params = await extract_store_query(user_text)
-    print("[DEBUG parser]", params)
-
-    if not params.get("is_store_query"):
-        await add_user_message(db, uid, user_text)
-        messages_for_model = await get_messages_for_model(db, uid, limit=10)
-        reply = await ask_openai(messages_for_model, db, uid)
-        await message.answer(reply)
-        await add_assistant_message(db, uid, reply)
-        return
-
-    raw_brand = params.get("brand")
-    raw_city = params.get("city")
-    region = params.get("region")
-
-    brand = match_brand(raw_brand) if raw_brand else None
-    city = match_city(raw_city) if raw_city else None
-
-    if brand and city:
-        stores = search_stores(brand, city, region)
-
-        if stores:
-            response_lines = []
-            for store in stores:
-                response_lines.append(
-                    f"*{store['brand']}*\n"
-                    f"Город: {store['city']}\n"
-                    f"Адрес: {store['address']}\n"
-                    f"График: {store['schedule']}\n"
-                )
-
-            reply = "\n".join(response_lines)
-            await message.answer(reply, parse_mode="Markdown")
-            await add_assistant_message(db, uid, reply)
-            return
-
-        await message.answer("Я ничего не нашёл. Попробуй другой запрос.")
-        return
-
-    if city and not brand and any(w in text_lower for w in ["магазин", "магазины", "маркет", "найди"]):
-        await message.answer(
-            f"Понял город, но не вижу известной мне сети.\n"
-            "Я умею искать только по конкретным брендам из базы, например: "
-            "«Наша Ряба», «М’ясомаркет».\n"
-            "Напиши, пожалуйста, название сети."
-        )
-        return
 
     await add_user_message(db, uid, user_text)
     messages_for_model = await get_messages_for_model(db, uid, limit=10)

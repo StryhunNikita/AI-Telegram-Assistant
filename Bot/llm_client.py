@@ -2,7 +2,7 @@ import os
 import json
 import httpx
 import dotenv
-from .db import Database
+from .db import Database, search_stores
 
 dotenv.load_dotenv()
 openai_key = os.getenv("OPENAI_API_KEY")
@@ -29,7 +29,40 @@ TOOLS = [
                 "required": ["query"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_stores",
+            "description": "Поиск магазинов по бренду, городу, адресу и/или региону",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "brand": {
+                        "type": "string",
+                        "description": "Название сети или бренда",
+                    },
+                    "city": {
+                        "type": "string",
+                        "description": "Город или населённый пункт",
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "Улица, микрорайон или ориентир",
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "Регион или область",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Максимум результатов",
+                        "default": 10,
+                    },
+                },
+            },
+        },
+    },
 ]
 
 async def _call_openai(data: dict) -> dict:
@@ -60,6 +93,7 @@ async def ask_openai(
         "Ты дружелюбный ассистент.\n"
         "Если пользователь просит найти, вспомнить или показать его прошлые сообщения, "
         "используй tool `search_messages`.\n"
+        "Если пользователь хочет найти магазины/бренд по городу/адресу, вызывай tool `search_stores`.\n"
         "Отвечай кратко и по делу."
     )
 
@@ -101,7 +135,7 @@ async def ask_openai(
         name = func.get("name")
         raw_args = func.get("arguments", "{}")
 
-        if name != "search_messages":
+        if name not in {"search_messages", "search_stores"}:
             tool_messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
@@ -124,7 +158,41 @@ async def ask_openai(
         query = args.get("query")
         limit = args.get("limit", 5)
 
-        if not query:
+        if name == "search_messages":
+            query = args.get("query")
+            limit = args.get("limit", 5)
+
+            if not query:
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": name,
+                    "content": "[]",
+                })
+                continue
+
+            try:
+                rows = await db.search_messages(user_id, query, limit)
+            except Exception as e:
+                return f"Ошибка при поиске в базе данных: {e}"
+
+            search_result = [{"content": row["content"]} for row in rows]
+
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "name": name,
+                "content": json.dumps(search_result, ensure_ascii=False),
+            })
+            continue
+
+        brand = args.get("brand")
+        city = args.get("city")
+        address = args.get("address")
+        region = args.get("region")
+        limit = args.get("limit", 10)
+
+        if not any([brand, city, address, region]):
             tool_messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
@@ -133,18 +201,19 @@ async def ask_openai(
             })
             continue
 
-        try:
-            rows = await db.search_messages(user_id, query, limit)
-        except Exception as e:
-            return f"Ошибка при поиске в базе данных: {e}"
-
-        search_result = [{"content": row["content"]} for row in rows]
+        stores = search_stores(
+            brand=brand,
+            city=city,
+            region=region,
+            address=address,
+            limit=limit,
+        )
 
         tool_messages.append({
             "role": "tool",
             "tool_call_id": call["id"],
             "name": name,
-            "content": json.dumps(search_result, ensure_ascii=False),
+            "content": json.dumps(stores, ensure_ascii=False),
         })
 
     followup_messages = [
@@ -176,63 +245,3 @@ async def ask_openai(
         return content.strip()
     except (KeyError, IndexError):
         return "Не смог разобрать финальный ответ от модели."
-
-async def extract_store_query(user_text: str) -> dict:
-    if not openai_key:
-        return {"is_store_query": False, "brand": None, "city": None, "region": None}
-
-    system_prompt = """
-    Ты модуль разбора запросов для поиска магазинов.
-
-    Твоя задача:
-    1) Определить, является ли сообщение пользователя запросом на поиск магазина/сети/заведения.
-    2) Если да — извлечь:
-    - brand: название сети/бренда (например: "Наша Ряба", "АТБ", "М’ясомаркет");
-    - city: город (как он написан в тексте, даже с ошибками, например: "чернике");
-    - region: область (если явно указана, иначе null).
-
-    Если сообщение НЕ про поиск магазинов (обычный разговор, вопрос ни о чём и т.п.),
-    то is_store_query = false, а brand/city/region = null.
-
-    Важные примеры:
-    - "найди нашу рябу в чернике" → is_store_query=true, brand="Наша Ряба", city="чернике"
-    - "найди магазины мяса в Киеве" → is_store_query=true, brand=null, city="Киеве"
-    - "привет, как дела?" → is_store_query=false
-
-    Формат ответа: строго JSON
-    {
-    "is_store_query": boolean,
-    "brand": string | null,
-    "city": string | null,
-    "region": string | null
-    }
-    """
-
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
-
-    response = await _call_openai(payload)
-    if "error" in response:
-        return {"is_store_query": False, "brand": None, "city": None, "region": None}
-
-    try:
-        raw = response["choices"][0]["message"]["content"]
-        parsed = json.loads(raw)
-    except Exception as e:
-        print("[extract_store_query] JSON parse error:", e)
-        print("[extract_store_query] RAW:", response)
-        return {"is_store_query": False, "brand": None, "city": None, "region": None}
-
-    return {
-        "is_store_query": bool(parsed.get("is_store_query", False)),
-        "brand": parsed.get("brand"),
-        "city": parsed.get("city"),
-        "region": parsed.get("region"),
-    }
