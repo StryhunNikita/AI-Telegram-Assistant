@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Optional
 import httpx
 import dotenv
 from .db import Database, search_stores
@@ -54,16 +55,20 @@ TOOLS = [
                         "type": "string",
                         "description": "Регион или область",
                     },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Максимум результатов",
-                        "default": 10,
-                    },
                 },
             },
         },
     },
 ]
+
+
+def _build_tool_message(call: dict, name: Optional[str], content: str = "[]") -> dict:
+    return {
+        "role": "tool",
+        "tool_call_id": call.get("id", ""),
+        "name": name or "unknown_tool",
+        "content": content,
+    }
 
 async def _call_openai(data: dict) -> dict:
     url = "https://api.openai.com/v1/chat/completions"
@@ -80,6 +85,90 @@ async def _call_openai(data: dict) -> dict:
     except Exception as e:
         print("[OPENAI ERROR]", e)
         return {"error": "openai_error"}
+
+
+async def _handle_search_messages_call(
+    call: dict,
+    args: dict,
+    db: Database,
+    user_id: int,
+):
+    query = args.get("query")
+    limit = args.get("limit", 5)
+
+    if not query:
+        return _build_tool_message(call, "search_messages")
+
+    try:
+        rows = await db.search_messages(user_id, query, limit)
+    except Exception as e:
+        return f"Ошибка при поиске в базе данных: {e}"
+
+    payload = [{"content": row["content"]} for row in rows]
+    return _build_tool_message(
+        call,
+        "search_messages",
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+
+def _handle_search_stores_call(call: dict, args: dict):
+    brand = args.get("brand")
+    city = args.get("city")
+    address = args.get("address")
+    region = args.get("region")
+
+    if not any([brand, city, address, region]):
+        return _build_tool_message(call, "search_stores")
+
+    stores = search_stores(
+        brand=brand,
+        city=city,
+        region=region,
+        address=address,
+        limit=10,
+    )
+
+    return _build_tool_message(
+        call,
+        "search_stores",
+        json.dumps(stores, ensure_ascii=False),
+    )
+
+
+async def _process_tool_calls(
+    tool_calls: list[dict],
+    db: Database,
+    user_id: int,
+) -> tuple[Optional[str], list[dict]]:
+    tool_messages: list[dict] = []
+
+    for call in tool_calls:
+        func = call.get("function", {})
+        name = func.get("name")
+        raw_args = func.get("arguments", "{}")
+
+        if name not in {"search_messages", "search_stores"}:
+            tool_messages.append(_build_tool_message(call, name))
+            continue
+
+        try:
+            args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            tool_messages.append(_build_tool_message(call, name))
+            continue
+
+        if name == "search_messages":
+            result = await _handle_search_messages_call(call, args, db, user_id)
+        else:
+            result = _handle_search_stores_call(call, args)
+
+        if isinstance(result, str):
+            return result, []
+
+        tool_messages.append(result)
+
+    return None, tool_messages
 
 async def ask_openai(
     messages: list[dict],
@@ -128,93 +217,9 @@ async def ask_openai(
             return "Модель не вернула текстового ответа."
         return content.strip()
 
-    tool_messages = []
-
-    for call in tool_calls:
-        func = call.get("function", {})
-        name = func.get("name")
-        raw_args = func.get("arguments", "{}")
-
-        if name not in {"search_messages", "search_stores"}:
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "name": name or "unknown_tool",
-                "content": "[]",
-            })
-            continue
-
-        try:
-            args = json.loads(raw_args)
-        except json.JSONDecodeError:
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "name": name,
-                "content": "[]",
-            })
-            continue
-
-        query = args.get("query")
-        limit = args.get("limit", 5)
-
-        if name == "search_messages":
-            query = args.get("query")
-            limit = args.get("limit", 5)
-
-            if not query:
-                tool_messages.append({
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "name": name,
-                    "content": "[]",
-                })
-                continue
-
-            try:
-                rows = await db.search_messages(user_id, query, limit)
-            except Exception as e:
-                return f"Ошибка при поиске в базе данных: {e}"
-
-            search_result = [{"content": row["content"]} for row in rows]
-
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "name": name,
-                "content": json.dumps(search_result, ensure_ascii=False),
-            })
-            continue
-
-        brand = args.get("brand")
-        city = args.get("city")
-        address = args.get("address")
-        region = args.get("region")
-        limit = args.get("limit", 10)
-
-        if not any([brand, city, address, region]):
-            tool_messages.append({
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "name": name,
-                "content": "[]",
-            })
-            continue
-
-        stores = search_stores(
-            brand=brand,
-            city=city,
-            region=region,
-            address=address,
-            limit=limit,
-        )
-
-        tool_messages.append({
-            "role": "tool",
-            "tool_call_id": call["id"],
-            "name": name,
-            "content": json.dumps(stores, ensure_ascii=False),
-        })
+    error, tool_messages = await _process_tool_calls(tool_calls, db, user_id)
+    if error:
+        return error
 
     followup_messages = [
         *base_messages,
